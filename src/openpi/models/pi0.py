@@ -147,6 +147,7 @@ class Pi0(_model.BaseModel):
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
+        ##### why llm is not "self"? using the bridge?
         llm = nnx_bridge.ToNNX(
             _gemma.Module(
                 configs=[paligemma_config, action_expert_config],
@@ -154,6 +155,7 @@ class Pi0(_model.BaseModel):
             )
         )
         llm.lazy_init(rngs=rngs, method="init")
+        ##### why img is also not "self"?
         img = nnx_bridge.ToNNX(
             _siglip.Module(
                 num_classes=paligemma_config.width,
@@ -164,7 +166,7 @@ class Pi0(_model.BaseModel):
             )
         )
         img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
-        self.PaliGemma = nnx.Dict(llm=llm, img=img)
+        self.PaliGemma = nnx.Dict(llm=llm, img=img)        # ilm and img are set in the class here
         self.state_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
         self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
@@ -175,12 +177,12 @@ class Pi0(_model.BaseModel):
     def embed_prefix(
         self, obs: _model.Observation
     ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
-        input_mask = []
+        input_mask = [] 
         ar_mask = []
         tokens = []
-        # embed images
+        # embed images   <--- tokenize the image
         for name in obs.images:
-            image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
+            image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)        # direct use the img
 
             tokens.append(image_tokens)
             input_mask.append(
@@ -195,11 +197,13 @@ class Pi0(_model.BaseModel):
 
         # add language (aka tokenized inputs)
         if obs.tokenized_prompt is not None:
-            tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
+            tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")   # use the llm
             tokens.append(tokenized_inputs)
             input_mask.append(obs.tokenized_prompt_mask)
             # full attention between image and language inputs
             ar_mask += [False] * tokenized_inputs.shape[1]
+
+        ##### get the overall token, masks
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
