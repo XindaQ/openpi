@@ -182,7 +182,7 @@ class Pi0(_model.BaseModel):
         tokens = []
         # embed images   <--- tokenize the image
         for name in obs.images:
-            image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)        # direct use the img
+            image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)        ##### forward compute of img
 
             tokens.append(image_tokens)
             input_mask.append(
@@ -197,7 +197,7 @@ class Pi0(_model.BaseModel):
 
         # add language (aka tokenized inputs)
         if obs.tokenized_prompt is not None:
-            tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")   # use the llm
+            tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")   ##### embed the token, rather than forward
             tokens.append(tokenized_inputs)
             input_mask.append(obs.tokenized_prompt_mask)
             # full attention between image and language inputs
@@ -245,6 +245,9 @@ class Pi0(_model.BaseModel):
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
+        
+        ##### this is the main process of the training, should include the forward process
+        
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
@@ -252,23 +255,23 @@ class Pi0(_model.BaseModel):
         noise = jax.random.normal(noise_rng, actions.shape)
         time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
         time_expanded = time[..., None, None]
-        x_t = time_expanded * noise + (1 - time_expanded) * actions
-        u_t = noise - actions
+        x_t = time_expanded * noise + (1 - time_expanded) * actions    ##### create the noisy actions
+        u_t = noise - actions            ##### this is the action prediction target
 
         # one big forward pass of prefix + suffix at once
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
-        suffix_tokens, suffix_mask, suffix_ar_mask = self.embed_suffix(observation, x_t, time)
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)                ##### get the prefix token 
+        suffix_tokens, suffix_mask, suffix_ar_mask = self.embed_suffix(observation, x_t, time)    ##### get the sufix token
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
-        ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
-        attn_mask = make_attn_mask(input_mask, ar_mask)
+        ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)            ##### the masks
+        attn_mask = make_attn_mask(input_mask, ar_mask)                                ##### causual maskes
         positions = jnp.cumsum(input_mask, axis=1) - 1
         (prefix_out, suffix_out), _ = self.PaliGemma.llm(
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions
-        )
-        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+        )                                                                                ##### one large forward step, for all tokens
+        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])            ##### get the action output v_T
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
-
+        return jnp.mean(jnp.square(v_t - u_t), axis=-1)                              ##### we are reduce loss between noise processes
+                                                                 ##### here the action is multi-step, for each step we have related noise process
     @override
     def sample_actions(
         self,
