@@ -247,14 +247,16 @@ class Pi0(_model.BaseModel):
     ) -> at.Float[at.Array, "*b ah"]:
         
         ##### this is the main process of the training, should include the forward process
+        ##### this output an action derivative with [b, ah], which is [batch, action horizon (50 length action chuck)]
+        ##### so a series of action is input to the model for training (50 steps)
         
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
         batch_shape = actions.shape[:-2]
         noise = jax.random.normal(noise_rng, actions.shape)
-        time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
-        time_expanded = time[..., None, None]
+        time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001   ##### sample one time in generation horizon
+        time_expanded = time[..., None, None]                                    # time is [batch, 1, 1] for boardcast to [b, ah, ad]
         x_t = time_expanded * noise + (1 - time_expanded) * actions    ##### create the noisy actions
         u_t = noise - actions            ##### this is the action prediction target
 
@@ -267,11 +269,15 @@ class Pi0(_model.BaseModel):
         positions = jnp.cumsum(input_mask, axis=1) - 1
         (prefix_out, suffix_out), _ = self.PaliGemma.llm(
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions
-        )                                                                                ##### one large forward step, for all tokens
+        )                                                                                ##### one large forward step, for all tokens, we do not record the KV_cache
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])            ##### get the action output v_T
 
         return jnp.mean(jnp.square(v_t - u_t), axis=-1)                              ##### we are reduce loss between noise processes
                                                                  ##### here the action is multi-step, for each step we have related noise process
+                                                                ##### so finally we learn how to get the action chunk from the noise
+                                                        ###### every time we get one noisy action output and cal v(A_t^tau, o_t)
+                                                        ##### this is a single clip in the flow-match multi-step
+                                                        ##### the dimension of the action is preserved
     @override
     def sample_actions(
         self,
@@ -280,18 +286,24 @@ class Pi0(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
     ) -> _model.Actions:
+
+        ##### denoising the action noise to generate a clear action chunk
+        
+        
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
-        dt = -1.0 / num_steps
+        dt = -1.0 / num_steps                            ##### prepare for the ODE solver 
         batch_size = observation.state.shape[0]
-        noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+        noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))        ##### get the initial noise action
 
         # first fill KV cache with a forward pass of the prefix
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+        ##### why the kv_cache is calculated in this way ???? Oh, so it is not the output of suffix, the output of llm should be {prefix_out, surffix_out}, kv_cache, _, _ (something else)
+        ##### this K, V cache is the out at the prefix at the suffix location, look at the input here [prefix_tokens, None]
 
         def step(carry):
             x_t, time = carry
@@ -318,10 +330,11 @@ class Pi0(_model.BaseModel):
             (prefix_out, suffix_out), _ = self.PaliGemma.llm(
                 [None, suffix_tokens], mask=full_attn_mask, positions=positions, kv_cache=kv_cache
             )
+            ##### notice that here the kv_cache is also injected to the llm
             assert prefix_out is None
-            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])        ##### get the action out
 
-            return x_t + dt * v_t, time + dt
+            return x_t + dt * v_t, time + dt            ##### use simple Euler method for updating the action
 
         def cond(carry):
             x_t, time = carry
